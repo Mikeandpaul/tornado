@@ -504,28 +504,68 @@ class _Select(object):
             events[fd] = events.get(fd, 0) | IOLoop.ERROR
         return events.items()
 
+class _ZMQ(object):
+    """Integrate with the ZMQ Event loop. PyZMQ already exposes a poll-like interface.
+       This piece of crap code just translates from poll to epoll."""
+    def __init__(self):
+        print 'NEW'
+        self.poller = zmq.Poller()
+        
+    def register(self, fd, events):
+        flags = 0
+        if events & IOLoop.READ: flags |= zmq.POLLIN
+        if events & IOLoop.WRITE: flags |= zmq.POLLOUT
+        if events & IOLoop.ERROR: flags |= zmq.POLLERR
+        
+        self.poller.register(fd, flags)
+
+    def modify(self, fd, events):
+        self.register(fd, events)
+
+    def unregister(self, fd):
+        self.poller.unregister(fd)
+
+    def poll(self, timeout):
+        if timeout is None:
+            timeout = -1
+        else:
+            timeout *= 1000
+        results = self.poller.poll(timeout)
+        reslist = []
+        for fd, flags in results:
+            outflags = 0
+            if flags & zmq.POLLIN: outflags |= IOLoop.READ
+            if flags & zmq.POLLOUT: outflags |= IOLoop.WRITE
+            if flags & zmq.POLLERR: outflags |= IOLoop.ERROR
+            reslist.append ( (fd, outflags) )
+        return reslist
 
 # Choose a poll implementation. Use epoll if it is available, fall back to
 # select() for non-Linux platforms
-if hasattr(select, "epoll"):
-    # Python 2.6+ on Linux
-    _poll = select.epoll
-elif hasattr(select, "kqueue"):
-    # Python 2.6+ on BSD or Mac
-    _poll = _KQueue
-else:
-    try:
-        # try to use libevent
-        import libevent
-        _poll = _LibEvent
-    except:
+
+try:
+    import zmq
+    _poll = _ZMQ
+except:
+    if hasattr(select, "epoll"):
+        # Python 2.6+ on Linux
+        _poll = select.epoll
+    elif hasattr(select, "kqueue"):
+        # Python 2.6+ on BSD or Mac
+        _poll = _KQueue
+    else:
         try:
-            # Linux systems with our C module installed
-            import epoll
-            _poll = _EPoll
+            # try to use libevent
+            import libevent
+            _poll = _LibEvent
         except:
-            # All other systems
-            import sys
-            if "linux" in sys.platform:
-                _log.warning("epoll module not found; using select()")
-            _poll = _Select
+            try:
+                # Linux systems with our C module installed
+                import epoll
+                _poll = _EPoll
+            except:
+                # All other systems
+                import sys
+                if "linux" in sys.platform:
+                    _log.warning("epoll module not found; using select()")
+                _poll = _Select
