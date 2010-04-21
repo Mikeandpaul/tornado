@@ -508,7 +508,6 @@ class _ZMQ(object):
     """Integrate with the ZMQ Event loop. PyZMQ already exposes a poll-like interface.
        This piece of crap code just translates from poll to epoll."""
     def __init__(self):
-        print 'NEW'
         self.poller = zmq.Poller()
         
     def register(self, fd, events):
