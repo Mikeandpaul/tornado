@@ -1259,7 +1259,7 @@ class GZipContentEncoding(OutputTransform):
     """
     CONTENT_TYPES = set([
         "text/plain", "text/html", "text/css", "text/xml",
-        "application/x-javascript", "application/xml", "application/atom+xml",
+        "application/x-javascript", "application/javascript", "application/xml", "application/atom+xml",
         "text/javascript", "application/json", "application/xhtml+xml"])
     MIN_LENGTH = 5
 
