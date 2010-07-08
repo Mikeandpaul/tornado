@@ -79,6 +79,8 @@ def _reload_on_update(io_loop, modify_times):
                     os.close(fd)
                 except:
                     pass
+            if hasattr(io_loop, 'on_reload'):
+                io_loop.on_reload()
             if hasattr(signal, "setitimer"):
                 # Clear the alarm signal set by
                 # ioloop.set_blocking_log_threshold so it doesn't fire
