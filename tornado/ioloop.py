@@ -355,6 +355,8 @@ class _Timeout(object):
         return cmp((self.deadline, id(self.callback)),
                    (other.deadline, id(other.callback)))
 
+    def __repr__(self):
+        return '<Timeout: %s %s>' % (self.deadline, self.callback)
 
 class PeriodicCallback(object):
     """Schedules the given callback to be called periodically.

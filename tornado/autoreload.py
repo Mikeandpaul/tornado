@@ -34,12 +34,18 @@ try:
 except ImportError:
     signal = None
 
+already_started = False
+
 def start(io_loop=None, check_time=500):
     """Restarts the process automatically when a module is modified.
 
     We run on the I/O loop, and restarting is a destructive operation,
     so will terminate any pending requests.
     """
+    global already_started
+    if already_started:
+        return
+    already_started = True
     io_loop = io_loop or ioloop.IOLoop.instance()
     modify_times = {}
     callback = functools.partial(_reload_on_update, io_loop, modify_times)
