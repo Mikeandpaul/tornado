@@ -719,6 +719,7 @@ class RequestHandler(object):
                 hashes[path] = None
         base = self.request.protocol + "://" + self.request.host \
             if getattr(self, "include_host", False) else ""
+        base = getattr(self, "include_host", False) if isinstance(getattr(self, "include_host", False), basestring) else ""
         static_url_prefix = self.settings.get('static_url_prefix', '/static/')
         if hashes.get(path):
             return base + static_url_prefix + path + "?v=" + hashes[path][:5]
