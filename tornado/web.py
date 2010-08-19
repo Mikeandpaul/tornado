@@ -294,10 +294,19 @@ class RequestHandler(object):
         self.set_cookie(name, value="", path=path, expires=expires,
                         domain=domain)
 
+    def thorough_clear_cookie(self, name):
+        self.clear_cookie(name)
+        self.clear_cookie(name, path='/')
+        
+        self.clear_cookie(name, path='/', domain='bbq.io')
+        self.clear_cookie(name, path='/', domain='.bbq.io')
+        self.clear_cookie(name, path='/', domain='dev.bbq.io')
+        self.clear_cookie(name, path='/', domain='.dev.bbq.io')        
+
     def clear_all_cookies(self):
         """Deletes all the cookies the user sent with this request."""
         for name in self.cookies.iterkeys():
-            self.clear_cookie(name)
+            self.thorough_clear_cookie(name)
 
     def set_secure_cookie(self, name, value, expires_days=30, **kwargs):
         """Signs and timestamps a cookie so it cannot be forged.

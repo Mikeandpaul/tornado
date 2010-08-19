@@ -235,6 +235,7 @@ class OAuthMixin(object):
             logging.warning("Missing OAuth request token cookie")
             callback(None)
             return
+        self.thorough_clear_cookie("_oauth_request_token") # XXX: ENKIMOD
         cookie_key, cookie_secret = request_cookie.split("|")
         if cookie_key != request_key:
             logging.warning("Request token does not match cookie")
@@ -255,6 +256,9 @@ class OAuthMixin(object):
             oauth_nonce=binascii.b2a_hex(uuid.uuid4().bytes),
             oauth_version="1.0",
         )
+        oacb = self.get_oauth_callback_uri()
+        if oacb:
+            args['oauth_callback'] = oacb
         signature = _oauth_signature(consumer_token, "GET", url, args)
         args["oauth_signature"] = signature
         return url + "?" + urllib.urlencode(args)
@@ -282,6 +286,10 @@ class OAuthMixin(object):
             oauth_nonce=binascii.b2a_hex(uuid.uuid4().bytes),
             oauth_version="1.0",
         )
+        oauth_verifier = self.get_argument('oauth_verifier', default=None)
+        if oauth_verifier:
+            args['oauth_verifier'] = oauth_verifier
+        
         signature = _oauth_signature(consumer_token, "GET", url, args,
                                      request_token)
         args["oauth_signature"] = signature
@@ -877,6 +885,6 @@ def _oauth_parse_response(body):
     token = dict(key=p["oauth_token"][0], secret=p["oauth_token_secret"][0])
 
     # Add the extra parameters the Provider included to the token
-    special = ("oauth_token", "oauth_token_secret")
+    special = ("oauth_token", "oauth_token_secret", 'oauth_callback_confirmed')
     token.update((k, p[k][0]) for k in p if k not in special)
     return token
