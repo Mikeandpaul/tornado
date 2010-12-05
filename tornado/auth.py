@@ -315,25 +315,25 @@ class OAuthMixin(object):
             oauth_nonce=binascii.b2a_hex(uuid.uuid4().bytes),
             oauth_version=getattr(self, "_OAUTH_VERSION", "1.0a"),
         )
-<<<<<<< HEAD
+# <<<<<<< HEAD
         oauth_verifier = self.get_argument('oauth_verifier', default=None)
         if oauth_verifier:
             args['oauth_verifier'] = oauth_verifier
         
         signature = _oauth_signature(consumer_token, "GET", url, args,
                                      request_token)
-=======
-        if "verifier" in request_token:
-          args["oauth_verifier"]=request_token["verifier"]
-
-        if getattr(self, "_OAUTH_VERSION", "1.0a") == "1.0a":
-            signature = _oauth10a_signature(consumer_token, "GET", url, args,
-                                            request_token)
-        else:
-            signature = _oauth_signature(consumer_token, "GET", url, args,
-                                         request_token)
-
->>>>>>> 8e4a7730d3fa599aa99fdc58d911d149344eb711
+# =======
+#         if "verifier" in request_token:
+#           args["oauth_verifier"]=request_token["verifier"]
+# 
+#         if getattr(self, "_OAUTH_VERSION", "1.0a") == "1.0a":
+#             signature = _oauth10a_signature(consumer_token, "GET", url, args,
+#                                             request_token)
+#         else:
+#             signature = _oauth_signature(consumer_token, "GET", url, args,
+#                                          request_token)
+# 
+# >>>>>>> 8e4a7730d3fa599aa99fdc58d911d149344eb711
         args["oauth_signature"] = signature
         return url + "?" + urllib.urlencode(args)
 
