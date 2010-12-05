@@ -25,8 +25,17 @@ import email.utils
 import errno
 import httplib
 import logging
-import pycurl
+import os
+try:
+    import pycurl
+except ImportError:
+    # See the other check for this variable at end of file
+    if os.environ.get('USE_SIMPLE_HTTPCLIENT'):
+        pycurl = None
+    else:
+        raise
 import sys
+import threading
 import time
 import weakref
 
@@ -62,7 +71,7 @@ class HTTPClient(object):
         If an error occurs during the fetch, we raise an HTTPError.
         """
         if not isinstance(request, HTTPRequest):
-           request = HTTPRequest(url=request, **kwargs)
+            request = HTTPRequest(url=request, **kwargs)
         buffer = cStringIO.StringIO()
         headers = httputil.HTTPHeaders()
         try:
@@ -171,11 +180,11 @@ class AsyncHTTPClient(object):
 
         If an error occurs during the fetch, the HTTPResponse given to the
         callback has a non-None error attribute that contains the exception
-        encountered during the request. You can call response.reraise() to
+        encountered during the request. You can call response.rethrow() to
         throw the exception (if any) in the callback.
         """
         if not isinstance(request, HTTPRequest):
-           request = HTTPRequest(url=request, **kwargs)
+            request = HTTPRequest(url=request, **kwargs)
         self._requests.append((request, stack_context.wrap(callback)))
         self._process_queue()
         self._set_timeout(0)
@@ -221,7 +230,7 @@ class AsyncHTTPClient(object):
             try:
                 ret, num_handles = self._socket_action(fd, action)
             except pycurl.error, e:
-                ret = e[0]
+                ret = e.args[0]
             if ret != pycurl.E_CALL_MULTI_PERFORM:
                 break
         self._finish_pending_requests()
@@ -235,7 +244,7 @@ class AsyncHTTPClient(object):
                     ret, num_handles = self._socket_action(
                         pycurl.SOCKET_TIMEOUT, 0)
                 except pycurl.error, e:
-                    ret = e[0]
+                    ret = e.args[0]
                 if ret != pycurl.E_CALL_MULTI_PERFORM:
                     break
             self._finish_pending_requests()
@@ -266,7 +275,7 @@ class AsyncHTTPClient(object):
                 try:
                     ret, num_handles = self._multi.socket_all()
                 except pycurl.error, e:
-                    ret = e[0]
+                    ret = e.args[0]
                 if ret != pycurl.E_CALL_MULTI_PERFORM:
                     break
             self._finish_pending_requests()
@@ -349,8 +358,11 @@ class AsyncHTTPClient(object):
         except (KeyboardInterrupt, SystemExit):
             raise
         except:
-            logging.error("Exception in callback %r", info["callback"],
-                          exc_info=True)
+            self.handle_callback_exception(info["callback"])
+
+
+    def handle_callback_exception(self, callback):
+        self.io_loop.handle_callback_exception(callback)
 
 # For backwards compatibility: Tornado 1.0 included a new implementation of
 # AsyncHTTPClient that has since replaced the original.  Define an alias
@@ -365,7 +377,8 @@ class HTTPRequest(object):
                  max_redirects=5, user_agent=None, use_gzip=True,
                  network_interface=None, streaming_callback=None,
                  header_callback=None, prepare_curl_callback=None,
-                 allow_nonstandard_methods=False):
+                 proxy_host=None, proxy_port=None, proxy_username=None,
+                 proxy_password='', allow_nonstandard_methods=False):
         if headers is None:
             headers = httputil.HTTPHeaders()
         if if_modified_since:
@@ -374,6 +387,12 @@ class HTTPRequest(object):
                 timestamp, localtime=False, usegmt=True)
         if "Pragma" not in headers:
             headers["Pragma"] = ""
+        # Proxy support: proxy_host and proxy_port must be set to connect via
+        # proxy.  The username and password credentials are optional.
+        self.proxy_host = proxy_host
+        self.proxy_port = proxy_port
+        self.proxy_username = proxy_username
+        self.proxy_password = proxy_password
         # libcurl's magic "Expect: 100-continue" behavior causes delays
         # with servers that don't support it (which include, among others,
         # Google's OpenID endpoint).  Additionally, this behavior has
@@ -461,10 +480,6 @@ class HTTPResponse(object):
         args = ",".join("%s=%r" % i for i in self.__dict__.iteritems())
         return "%s(%s)" % (self.__class__.__name__, args)
 
-    def __del__(self):
-        if self.buffer is not None:
-            self.buffer.close()
-
 
 class HTTPError(Exception):
     """Exception thrown for an unsuccessful HTTP request.
@@ -504,8 +519,8 @@ def _curl_setup_request(curl, request, buffer, headers):
     curl.setopt(pycurl.URL, request.url)
     # Request headers may be either a regular dict or HTTPHeaders object
     if isinstance(request.headers, httputil.HTTPHeaders):
-      curl.setopt(pycurl.HTTPHEADER,
-                  [_utf8("%s: %s" % i) for i in request.headers.get_all()])
+        curl.setopt(pycurl.HTTPHEADER,
+                    [_utf8("%s: %s" % i) for i in request.headers.get_all()])
     else:
         curl.setopt(pycurl.HTTPHEADER,
                     [_utf8("%s: %s" % i) for i in request.headers.iteritems()])
@@ -532,6 +547,15 @@ def _curl_setup_request(curl, request, buffer, headers):
         curl.setopt(pycurl.ENCODING, "gzip,deflate")
     else:
         curl.setopt(pycurl.ENCODING, "none")
+    if request.proxy_host and request.proxy_port:
+        curl.setopt(pycurl.PROXY, request.proxy_host)
+        curl.setopt(pycurl.PROXYPORT, request.proxy_port)
+        if request.proxy_username:
+            credentials = '%s:%s' % (request.proxy_username,
+                    request.proxy_password)
+            curl.setopt(pycurl.PROXYUSERPWD, credentials)
+    else:
+        curl.setopt(pycurl.PROXY, '')
 
     # Set the request method through curl's retarded interface which makes
     # up names for almost every single method
@@ -574,6 +598,16 @@ def _curl_setup_request(curl, request, buffer, headers):
     else:
         curl.unsetopt(pycurl.USERPWD)
         logging.info("%s %s", request.method, request.url)
+    if threading.activeCount() > 1:
+        # libcurl/pycurl is not thread-safe by default.  When multiple threads
+        # are used, signals should be disabled.  This has the side effect
+        # of disabling DNS timeouts in some environments (when libcurl is
+        # not linked against ares), so we don't do it when there is only one
+        # thread.  Applications that use many short-lived threads may need
+        # to set NOSIGNAL manually in a prepare_curl_callback since
+        # there may not be any other threads running at the time we call
+        # threading.activeCount.
+        curl.setopt(pycurl.NOSIGNAL, 1)
     if request.prepare_curl_callback is not None:
         request.prepare_curl_callback(curl)
 
@@ -628,6 +662,13 @@ def main():
         if options.print_body:
             print response.body
 
+# If the environment variable USE_SIMPLE_HTTPCLIENT is set to a non-empty
+# string, use SimpleAsyncHTTPClient instead of AsyncHTTPClient.
+# This is provided as a convenience for testing SimpleAsyncHTTPClient,
+# and may be removed or replaced with a better way of specifying the preferred
+# HTTPClient implementation before the next release.
+if os.environ.get('USE_SIMPLE_HTTPCLIENT'):
+    from tornado.simple_httpclient import SimpleAsyncHTTPClient as AsyncHTTPClient
+
 if __name__ == "__main__":
     main()
-

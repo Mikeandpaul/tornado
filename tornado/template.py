@@ -115,6 +115,7 @@ class Template(object):
         """Generate this template with the given arguments."""
         namespace = {
             "escape": escape.xhtml_escape,
+            "xhtml_escape": escape.xhtml_escape,
             "url_escape": escape.url_escape,
             "json_encode": escape.json_encode,
             "squeeze": escape.squeeze,
@@ -170,7 +171,7 @@ class Loader(object):
         self.templates = {}
 
     def reset(self):
-      self.templates = {}
+        self.templates = {}
 
     def resolve_path(self, name, parent_path=None):
         if parent_path and not parent_path.startswith("<") and \
@@ -428,7 +429,7 @@ class _TemplateReader(object):
     def __getitem__(self, key):
         if type(key) is slice:
             size = len(self)
-            start, stop, step = slice.indices(size)
+            start, stop, step = key.indices(size)
             if start is None: start = self.pos
             else: start += self.pos
             if stop is not None: stop += self.pos
@@ -531,7 +532,8 @@ def _parse(reader, in_block=None):
                 raise ParseError("Extra {%% end %%} block on line %d" % line)
             return body
 
-        elif operator in ("extends", "include", "set", "import", "comment"):
+        elif operator in ("extends", "include", "set", "import", "from",
+                          "comment"):
             if operator == "comment":
                 continue
             if operator == "extends":
@@ -539,7 +541,7 @@ def _parse(reader, in_block=None):
                 if not suffix:
                     raise ParseError("extends missing file path on line %d" % line)
                 block = _ExtendsBlock(suffix)
-            elif operator == "import":
+            elif operator in ("import", "from"):
                 if not suffix:
                     raise ParseError("import missing statement on line %d" % line)
                 block = _Statement(contents)

@@ -23,7 +23,6 @@ Tornado non-blocking web server and tools.
 
 Here is the canonical "Hello, world" example app:
 
-    import tornado.httpserver
     import tornado.ioloop
     import tornado.web
 
@@ -35,12 +34,11 @@ Here is the canonical "Hello, world" example app:
         application = tornado.web.Application([
             (r"/", MainHandler),
         ])
-        http_server = tornado.httpserver.HTTPServer(application)
-        http_server.listen(8888)
+        application.listen(8888)
         tornado.ioloop.IOLoop.instance().start()
 
-See the Tornado walkthrough on GitHub for more details and a good
-getting started guide.
+See the Tornado walkthrough on http://tornadoweb.org for more details
+and a good getting started guide.
 """
 
 from __future__ import with_statement
@@ -65,6 +63,7 @@ import re
 import stat
 import sys
 import time
+import tornado
 import types
 import urllib
 import urlparse
@@ -82,7 +81,7 @@ class RequestHandler(object):
     should override the class variable SUPPORTED_METHODS in your
     RequestHandler class.
     """
-    SUPPORTED_METHODS = ("GET", "HEAD", "POST", "DELETE", "PUT")
+    SUPPORTED_METHODS = ("GET", "HEAD", "POST", "DELETE", "PUT", "OPTIONS")
 
     def __init__(self, application, request, **kwargs):
         self.application = application
@@ -141,6 +140,9 @@ class RequestHandler(object):
     def put(self, *args, **kwargs):
         raise HTTPError(405)
 
+    def options(self, *args, **kwargs):
+        raise HTTPError(405)
+
     def prepare(self):
         """Called before the actual handler method.
 
@@ -155,18 +157,17 @@ class RequestHandler(object):
         You may override this to clean up resources associated with
         long-lived connections.
 
-        Note that the select()-based implementation of IOLoop does not detect
-        closed connections and so this method will not be called until
-        you try (and fail) to produce some output.  The epoll- and kqueue-
-        based implementations should detect closed connections even while
-        the request is idle.
+        Proxies may keep a connection open for a time (perhaps
+        indefinitely) after the client has gone away, so this method
+        may not be called promptly after the end user closes their
+        connection.
         """
         pass
 
     def clear(self):
         """Resets all headers and content for this response."""
         self._headers = {
-            "Server": "TornadoServer/1.0",
+            "Server": "TornadoServer/%s" % tornado.version,
             "Content-Type": "text/html; charset=UTF-8",
         }
         if not self.request.supports_http_1_1():
@@ -317,11 +318,21 @@ class RequestHandler(object):
 
         To read a cookie set with this method, use get_secure_cookie().
         """
+        self.set_cookie(name, self.create_signed_value(name, value),
+                        expires_days=expires_days, **kwargs)
+
+    def create_signed_value(self, name, value):
+        """Signs and timestamps a string so it cannot be forged.
+
+        Normally used via set_secure_cookie, but provided as a separate
+        method for non-cookie uses.  To decode a value not stored
+        as a cookie use the optional value argument to get_secure_cookie.
+        """
         timestamp = str(int(time.time()))
         value = base64.b64encode(value)
         signature = self._cookie_signature(name, value, timestamp)
         value = "|".join([value, timestamp, signature])
-        self.set_cookie(name, value, expires_days=expires_days, **kwargs)
+        return value
 
     def get_secure_cookie(self, name, include_name=True, value=None):
         """Returns the given signed cookie if it validates, or None.
@@ -348,6 +359,16 @@ class RequestHandler(object):
         if timestamp < time.time() - 31 * 86400:
             logging.warning("Expired cookie %r", value)
             return None
+        if timestamp > time.time() + 31 * 86400:
+            # _cookie_signature does not hash a delimiter between the
+            # parts of the cookie, so an attacker could transfer trailing
+            # digits from the payload to the timestamp without altering the
+            # signature.  For backwards compatibility, sanity-check timestamp
+            # here instead of modifying _cookie_signature.
+            logging.warning("Cookie timestamp in future; possible tampering %r", value)
+            return None
+        if parts[1].startswith("0"):
+            logging.warning("Tampered cookie %r", value)
         try:
             return base64.b64decode(parts[0])
         except:
@@ -377,6 +398,11 @@ class RequestHandler(object):
 
         If the given chunk is a dictionary, we write it as JSON and set
         the Content-Type of the response to be text/javascript.
+
+        Note that lists are not converted to JSON because of a potential
+        cross-site security vulnerability.  All JSON output should be
+        wrapped in a dictionary.  More details at
+        http://haacked.com/archive/2008/11/20/anatomy-of-a-subtle-json-vulnerability.aspx
         """
         assert not self._finished
         if isinstance(chunk, dict):
@@ -438,12 +464,14 @@ class RequestHandler(object):
             sloc = html.rindex('</body>')
             html = html[:sloc] + js + '\n' + html[sloc:]
         if css_files:
-            paths = set()
+            paths = []
+            unique_paths = set()
             for path in css_files:
                 if not path.startswith("/") and not path.startswith("http:"):
-                    paths.add(self.static_url(path))
-                else:
-                    paths.add(path)
+                    path = self.static_url(path)
+                if path not in unique_paths:
+                    paths.append(path)
+                    unique_paths.add(path)
             css = ''.join('<link href="' + escape.xhtml_escape(p) + '" '
                           'type="text/css" rel="stylesheet"/>'
                           for p in paths)
@@ -531,7 +559,8 @@ class RequestHandler(object):
         # Automatically support ETags and add the Content-Length header if
         # we have not flushed any content yet.
         if not self._headers_written:
-            if (self._status_code == 200 and self.request.method == "GET" and
+            if (self._status_code == 200 and
+                self.request.method in ("GET", "HEAD") and
                 "Etag" not in self._headers):
                 hasher = hashlib.sha1()
                 for part in self._write_buffer:
@@ -762,9 +791,9 @@ class RequestHandler(object):
             return base + static_url_prefix + path
 
     def async_callback(self, callback, *args, **kwargs):
-        """Wrap callbacks with this if they are used on asynchronous requests.
+        """Obsolete - catches exceptions from the wrapped function.
 
-        Catches exceptions and properly finishes the request.
+        This function is unnecessary since Tornado 1.1.
         """
         if callback is None:
             return None
@@ -906,7 +935,7 @@ def removeslash(method):
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
         if self.request.path.endswith("/"):
-            if self.request.method == "GET":
+            if self.request.method in ("GET", "HEAD"):
                 uri = self.request.path.rstrip("/")
                 if self.request.query: uri += "?" + self.request.query
                 self.redirect(uri)
@@ -926,7 +955,7 @@ def addslash(method):
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
         if not self.request.path.endswith("/"):
-            if self.request.method == "GET":
+            if self.request.method in ("GET", "HEAD"):
                 uri = self.request.path + "/"
                 if self.request.query: uri += "?" + self.request.query
                 self.redirect(uri)
@@ -1011,8 +1040,33 @@ class Application(object):
             import autoreload
             autoreload.start()
 
+    def listen(self, port, address="", **kwargs):
+        """Starts an HTTP server for this application on the given port.
+
+        This is a convenience alias for creating an HTTPServer object
+        and calling its listen method.  Keyword arguments not
+        supported by HTTPServer.listen are passed to the HTTPServer
+        constructor.  For advanced uses (e.g. preforking), do not use
+        this method; create an HTTPServer and call its bind/start
+        methods directly.
+
+        Note that after calling this method you still need to call
+        IOLoop.instance().start() to start the server.
+        """
+        # import is here rather than top level because HTTPServer
+        # is not importable on appengine
+        from tornado.httpserver import HTTPServer
+        server = HTTPServer(self, **kwargs)
+        server.listen(port, address)
+
     def add_handlers(self, host_pattern, host_handlers):
-        """Appends the given handlers to our handler list."""
+        """Appends the given handlers to our handler list.
+
+        Note that host patterns are processed sequentially in the
+        order they were added, and only the first matching pattern is
+        used.  This means that all handlers for a given host must be
+        added in a single add_handlers call.
+        """
         if not host_pattern.endswith("$"):
             host_pattern += "$"
         handlers = []
@@ -1096,7 +1150,7 @@ class Application(object):
         handlers = self._get_host_handlers(request)
         if not handlers:
             handler = RedirectHandler(
-                request, "http://" + self.default_host + "/")
+                self, request, "http://" + self.default_host + "/")
         else:
             for spec in handlers:
                 match = spec.regex.match(request.path)
@@ -1124,8 +1178,8 @@ class Application(object):
         # request so you don't need to restart to see changes
         if self.settings.get("debug"):
             if getattr(RequestHandler, "_templates", None):
-              map(lambda loader: loader.reset(),
-                  RequestHandler._templates.values())
+                for loader in RequestHandler._templates.values():
+                    loader.reset()
             RequestHandler._static_hashes = {}
 
         handler._execute(transforms, *args, **kwargs)
@@ -1203,17 +1257,30 @@ class StaticFileHandler(RequestHandler):
     want browsers to cache a file indefinitely, send them to, e.g.,
     /static/images/myimage.png?v=xxx.
     """
-    def __init__(self, application, request, path):
+    def __init__(self, application, request, path, default_filename=None):
         RequestHandler.__init__(self, application, request)
         self.root = os.path.abspath(path) + os.path.sep
+        self.default_filename = default_filename
 
     def head(self, path):
         self.get(path, include_body=False)
 
     def get(self, path, include_body=True):
+        if os.path.sep != "/":
+            path = path.replace("/", os.path.sep)
         abspath = os.path.abspath(os.path.join(self.root, path))
-        if not abspath.startswith(self.root):
+        # os.path.abspath strips a trailing /
+        # it needs to be temporarily added back for requests to root/
+        if not (abspath + os.path.sep).startswith(self.root):
             raise HTTPError(403, "%s is not in root static directory", path)
+        if os.path.isdir(abspath) and self.default_filename is not None:
+            # need to look at the request.path here for when path is empty
+            # but there is some prefix to the path that was already
+            # trimmed by the routing
+            if not self.request.path.endswith("/"):
+                self.redirect(self.request.path + "/")
+                return
+            abspath = os.path.join(abspath, self.default_filename)
         if not os.path.exists(abspath):
             raise HTTPError(404)
         if not os.path.isfile(abspath):
@@ -1247,7 +1314,6 @@ class StaticFileHandler(RequestHandler):
 
         if not include_body:
             return
-        self.set_header("Content-Length", stat_result[stat.ST_SIZE])
         file = open(abspath, "rb")
         try:
             self.write(file.read())
@@ -1255,8 +1321,8 @@ class StaticFileHandler(RequestHandler):
             file.close()
 
     def set_extra_headers(self, path):
-      """For subclass to add extra headers to the response"""
-      pass
+        """For subclass to add extra headers to the response"""
+        pass
 
 
 class FallbackHandler(RequestHandler):
@@ -1379,7 +1445,7 @@ def authenticated(method):
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
         if not self.current_user:
-            if self.request.method == "GET":
+            if self.request.method in ("GET", "HEAD"):
                 url = self.get_login_url()
                 if "?" not in url:
                     if urlparse.urlsplit(url).scheme:
