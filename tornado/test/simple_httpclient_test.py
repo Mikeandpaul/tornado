@@ -9,9 +9,9 @@ import socket
 
 from contextlib import closing
 from tornado.ioloop import IOLoop
-from tornado.simple_httpclient import SimpleAsyncHTTPClient
+from tornado.simple_httpclient import SimpleAsyncHTTPClient, _DEFAULT_CA_CERTS
 from tornado.testing import AsyncHTTPTestCase, LogTrapTestCase, get_unused_port
-from tornado.web import Application, RequestHandler, asynchronous
+from tornado.web import Application, RequestHandler, asynchronous, url
 
 class HelloWorldHandler(RequestHandler):
     def get(self):
@@ -50,24 +50,34 @@ class TriggerHandler(RequestHandler):
         self.queue.append(self.finish)
         self.wake_callback()
 
+class CountdownHandler(RequestHandler):
+    def get(self, count):
+        count = int(count)
+        if count > 0:
+            self.redirect(self.reverse_url("countdown", count - 1))
+        else:
+            self.write("Zero")
+
 class SimpleHTTPClientTestCase(AsyncHTTPTestCase, LogTrapTestCase):
     def get_app(self):
         # callable objects to finish pending /trigger requests
         self.triggers = collections.deque()
         return Application([
-            ("/hello", HelloWorldHandler),
-            ("/post", PostHandler),
-            ("/chunk", ChunkHandler),
-            ("/auth", AuthHandler),
-            ("/hang", HangHandler),
-            ("/trigger", TriggerHandler, dict(queue=self.triggers,
-                                              wake_callback=self.stop)),
+            url("/hello", HelloWorldHandler),
+            url("/post", PostHandler),
+            url("/chunk", ChunkHandler),
+            url("/auth", AuthHandler),
+            url("/hang", HangHandler),
+            url("/trigger", TriggerHandler, dict(queue=self.triggers,
+                                                 wake_callback=self.stop)),
+            url("/countdown/([0-9]+)", CountdownHandler, name="countdown"),
             ], gzip=True)
 
     def setUp(self):
         super(SimpleHTTPClientTestCase, self).setUp()
         # replace the client defined in the parent class
-        self.http_client = SimpleAsyncHTTPClient(io_loop=self.io_loop)
+        self.http_client = SimpleAsyncHTTPClient(io_loop=self.io_loop,
+                                                 force_instance=True)
 
     def test_hello_world(self):
         response = self.fetch("/hello")
@@ -129,7 +139,9 @@ class SimpleHTTPClientTestCase(AsyncHTTPTestCase, LogTrapTestCase):
         port = get_unused_port()
 
         with closing(socket.socket()) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(('', port))
+            sock.listen(1)
             self.http_client.fetch("http://localhost:%d/" % port,
                                    self.stop,
                                    connect_timeout=0.1)
@@ -173,6 +185,35 @@ class SimpleHTTPClientTestCase(AsyncHTTPTestCase, LogTrapTestCase):
         self.triggers.popleft()()
         self.wait(condition=lambda: (len(self.triggers) == 2 and
                                      len(seen) == 2))
-        self.assertEqual(seen, [0, 1])
+        self.assertEqual(set(seen), set([0, 1]))
         self.assertEqual(len(client.queue), 0)
+
+        # Finish all the pending requests
+        self.triggers.popleft()()
+        self.triggers.popleft()()
+        self.wait(condition=lambda: len(seen) == 4)
+        self.assertEqual(set(seen), set([0, 1, 2, 3]))
+        self.assertEqual(len(self.triggers), 0)
+
+    def test_follow_redirect(self):
+        response = self.fetch("/countdown/2", follow_redirects=False)
+        self.assertEqual(302, response.code)
+        self.assertTrue(response.headers["Location"].endswith("/countdown/1"))
+
+        response = self.fetch("/countdown/2")
+        self.assertEqual(200, response.code)
+        self.assertTrue(response.effective_url.endswith("/countdown/0"))
+        self.assertEqual("Zero", response.body)
+
+    def test_max_redirects(self):
+        response = self.fetch("/countdown/5", max_redirects=3)
+        self.assertEqual(302, response.code)
+        # We requested 5, followed three redirects for 4, 3, 2, then the last
+        # unfollowed redirect is to 1.
+        self.assertTrue(response.request.url.endswith("/countdown/5"))
+        self.assertTrue(response.effective_url.endswith("/countdown/2"))
+        self.assertTrue(response.headers["Location"].endswith("/countdown/1"))
+
+    def test_default_certificates_exist(self):
+        open(_DEFAULT_CA_CERTS)
 

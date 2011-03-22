@@ -18,9 +18,11 @@
 
 from __future__ import with_statement
 
+import collections
 import errno
 import logging
 import socket
+import sys
 
 from tornado import ioloop
 from tornado import stack_context
@@ -81,8 +83,9 @@ class IOStream(object):
         self.io_loop = io_loop or ioloop.IOLoop.instance()
         self.max_buffer_size = max_buffer_size
         self.read_chunk_size = read_chunk_size
-        self._read_buffer = ""
-        self._write_buffer = ""
+        self._read_buffer = collections.deque()
+        self._write_buffer = collections.deque()
+        self._write_buffer_frozen = False
         self._read_delimiter = None
         self._read_bytes = None
         self._read_callback = None
@@ -159,7 +162,7 @@ class IOStream(object):
         callback is simply overwritten with this new callback.
         """
         self._check_closed()
-        self._write_buffer += data
+        self._write_buffer.append(data)
         self._add_io_state(self.io_loop.WRITE)
         self._write_callback = stack_context.wrap(callback)
 
@@ -182,7 +185,7 @@ class IOStream(object):
 
     def writing(self):
         """Returns true if we are currently writing to the stream."""
-        return len(self._write_buffer) > 0
+        return bool(self._write_buffer)
 
     def closed(self):
         return self.socket is None
@@ -206,9 +209,9 @@ class IOStream(object):
                 self.close()
                 return
             state = self.io_loop.ERROR
-            if self._read_delimiter or self._read_bytes:
+            if self.reading():
                 state |= self.io_loop.READ
-            if self._write_buffer:
+            if self.writing():
                 state |= self.io_loop.WRITE
             if state != self._state:
                 self._state = state
@@ -290,8 +293,8 @@ class IOStream(object):
             raise
         if chunk is None:
             return 0
-        self._read_buffer += chunk
-        if len(self._read_buffer) >= self.max_buffer_size:
+        self._read_buffer.append(chunk)
+        if self._read_buffer_size() >= self.max_buffer_size:
             logging.error("Reached maximum read buffer size")
             self.close()
             raise IOError("Reached maximum read buffer size")
@@ -303,7 +306,7 @@ class IOStream(object):
         Returns True if the read was completed.
         """
         if self._read_bytes:
-            if len(self._read_buffer) >= self._read_bytes:
+            if self._read_buffer_size() >= self._read_bytes:
                 num_bytes = self._read_bytes
                 callback = self._read_callback
                 self._read_callback = None
@@ -311,7 +314,8 @@ class IOStream(object):
                 self._run_callback(callback, self._consume(num_bytes))
                 return True
         elif self._read_delimiter:
-            loc = self._read_buffer.find(self._read_delimiter)
+            _merge_prefix(self._read_buffer, sys.maxint)
+            loc = self._read_buffer[0].find(self._read_delimiter)
             if loc != -1:
                 callback = self._read_callback
                 delimiter_len = len(self._read_delimiter)
@@ -332,14 +336,28 @@ class IOStream(object):
     def _handle_write(self):
         while self._write_buffer:
             try:
-                # On windows, socket.send blows up if given a write buffer
-                # that's too large, instead of just returning the number
-                # of bytes it was able to process.
-                temp_write_buffer = self._write_buffer[:128 * 1024]
-                num_bytes = self.socket.send(temp_write_buffer)
-                self._write_buffer = self._write_buffer[num_bytes:]
+                if not self._write_buffer_frozen:
+                    # On windows, socket.send blows up if given a
+                    # write buffer that's too large, instead of just
+                    # returning the number of bytes it was able to
+                    # process.  Therefore we must not call socket.send
+                    # with more than 128KB at a time.
+                    _merge_prefix(self._write_buffer, 128 * 1024)
+                num_bytes = self.socket.send(self._write_buffer[0])
+                self._write_buffer_frozen = False
+                _merge_prefix(self._write_buffer, num_bytes)
+                self._write_buffer.popleft()
             except socket.error, e:
                 if e.args[0] in (errno.EWOULDBLOCK, errno.EAGAIN):
+                    # With OpenSSL, after send returns EWOULDBLOCK,
+                    # the very same string object must be used on the
+                    # next call to send.  Therefore we suppress
+                    # merging the write buffer after an EWOULDBLOCK.
+                    # A cleaner solution would be to set
+                    # SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER, but this is
+                    # not yet accessible from python
+                    # (http://bugs.python.org/issue8240)
+                    self._write_buffer_frozen = True
                     break
                 else:
                     logging.warning("Write error on %d: %s",
@@ -352,9 +370,8 @@ class IOStream(object):
             self._run_callback(callback)
 
     def _consume(self, loc):
-        result = self._read_buffer[:loc]
-        self._read_buffer = self._read_buffer[loc:]
-        return result
+        _merge_prefix(self._read_buffer, loc)
+        return self._read_buffer.popleft()
 
     def _check_closed(self):
         if not self.socket:
@@ -368,6 +385,9 @@ class IOStream(object):
             self._state = self._state | state
             self.io_loop.update_handler(self.socket.fileno(), self._state)
 
+    def _read_buffer_size(self):
+        return sum(len(chunk) for chunk in self._read_buffer)
+
 
 class SSLIOStream(IOStream):
     """A utility class to write to and read from a non-blocking socket.
@@ -379,19 +399,35 @@ class SSLIOStream(IOStream):
     wrapped when IOStream.connect is finished.
     """
     def __init__(self, *args, **kwargs):
+        """Creates an SSLIOStream.
+
+        If a dictionary is provided as keyword argument ssl_options,
+        it will be used as additional keyword arguments to ssl.wrap_socket.
+        """
+        self._ssl_options = kwargs.pop('ssl_options', {})
         super(SSLIOStream, self).__init__(*args, **kwargs)
         self._ssl_accepting = True
+        self._handshake_reading = False
+        self._handshake_writing = False
+
+    def reading(self):
+        return self._handshake_reading or super(SSLIOStream, self).reading()
+
+    def writing(self):
+        return self._handshake_writing or super(SSLIOStream, self).writing()
 
     def _do_ssl_handshake(self):
         # Based on code from test_ssl.py in the python stdlib
         try:
+            self._handshake_reading = False
+            self._handshake_writing = False
             self.socket.do_handshake()
         except ssl.SSLError, err:
             if err.args[0] == ssl.SSL_ERROR_WANT_READ:
-                self._add_io_state(self.io_loop.READ)
+                self._handshake_reading = True
                 return
             elif err.args[0] == ssl.SSL_ERROR_WANT_WRITE:
-                self._add_io_state(self.io_loop.WRITE)
+                self._handshake_writing = True
                 return
             elif err.args[0] in (ssl.SSL_ERROR_EOF,
                                  ssl.SSL_ERROR_ZERO_RETURN):
@@ -405,6 +441,7 @@ class SSLIOStream(IOStream):
                 return self.close()
         else:
             self._ssl_accepting = False
+            super(SSLIOStream, self)._handle_connect()
 
     def _handle_read(self):
         if self._ssl_accepting:
@@ -419,10 +456,13 @@ class SSLIOStream(IOStream):
         super(SSLIOStream, self)._handle_write()
 
     def _handle_connect(self):
-        # TODO(bdarnell): cert verification, etc
         self.socket = ssl.wrap_socket(self.socket,
-                                      do_handshake_on_connect=False)
-        super(SSLIOStream, self)._handle_connect()
+                                      do_handshake_on_connect=False,
+                                      **self._ssl_options)
+        # Don't call the superclass's _handle_connect (which is responsible
+        # for telling the application that the connection is complete)
+        # until we've completed the SSL handshake (so certificates are
+        # available, etc).
 
 
     def _read_from_socket(self):
@@ -449,3 +489,36 @@ class SSLIOStream(IOStream):
             self.close()
             return None
         return chunk
+
+def _merge_prefix(deque, size):
+    """Replace the first entries in a deque of strings with a single
+    string of up to size bytes.
+
+    >>> d = collections.deque(['abc', 'de', 'fghi', 'j'])
+    >>> _merge_prefix(d, 5); print d
+    deque(['abcde', 'fghi', 'j'])
+
+    Strings will be split as necessary to reach the desired size.
+    >>> _merge_prefix(d, 7); print d
+    deque(['abcdefg', 'hi', 'j'])
+
+    >>> _merge_prefix(d, 3); print d
+    deque(['abc', 'defg', 'hi', 'j'])
+
+    >>> _merge_prefix(d, 100); print d
+    deque(['abcdefghij'])
+    """
+    prefix = []
+    remaining = size
+    while deque and remaining > 0:
+        chunk = deque.popleft()
+        if len(chunk) > remaining:
+            deque.appendleft(chunk[remaining:])
+            chunk = chunk[:remaining]
+        prefix.append(chunk)
+        remaining -= len(chunk)
+    deque.appendleft(''.join(prefix))
+
+def doctests():
+    import doctest
+    return doctest.DocTestSuite()

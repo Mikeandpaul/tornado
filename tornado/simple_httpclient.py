@@ -2,7 +2,7 @@
 from __future__ import with_statement
 
 from cStringIO import StringIO
-from tornado.httpclient import HTTPRequest, HTTPResponse, HTTPError
+from tornado.httpclient import HTTPRequest, HTTPResponse, HTTPError, AsyncHTTPClient
 from tornado.httputil import HTTPHeaders
 from tornado.ioloop import IOLoop
 from tornado.iostream import IOStream, SSLIOStream
@@ -10,14 +10,15 @@ from tornado import stack_context
 
 import collections
 import contextlib
+import copy
 import errno
 import functools
 import logging
+import os.path
 import re
 import socket
 import time
 import urlparse
-import weakref
 import zlib
 
 try:
@@ -25,34 +26,40 @@ try:
 except ImportError:
     ssl = None
 
-class SimpleAsyncHTTPClient(object):
-    """Non-blocking HTTP client with no external dependencies.
+_DEFAULT_CA_CERTS = os.path.dirname(__file__) + '/ca-certificates.crt'
 
-    WARNING:  This class is still in development and not yet recommended
-    for production use.
+class SimpleAsyncHTTPClient(AsyncHTTPClient):
+    """Non-blocking HTTP client with no external dependencies.
 
     This class implements an HTTP 1.1 client on top of Tornado's IOStreams.
     It does not currently implement all applicable parts of the HTTP
     specification, but it does enough to work with major web service APIs
     (mostly tested against the Twitter API so far).
 
-    Many features found in the curl-based AsyncHTTPClient are not yet
-    implemented.  The currently-supported set of parameters to HTTPRequest
-    are url, method, headers, body, streaming_callback, and header_callback.
-    Connections are not reused, and no attempt is made to limit the number
-    of outstanding requests.
+    This class has not been tested extensively in production and
+    should be considered somewhat experimental as of the release of
+    tornado 1.2.  It is intended to become the default AsyncHTTPClient
+    implementation in a future release.  It may either be used
+    directly, or to facilitate testing of this class with an existing
+    application, setting the environment variable
+    USE_SIMPLE_HTTPCLIENT=1 will cause this class to transparently
+    replace tornado.httpclient.AsyncHTTPClient.
+
+    Some features found in the curl-based AsyncHTTPClient are not yet
+    supported.  In particular, proxies are not supported, connections
+    are not reused, and callers cannot select the network interface to be 
+    used.
 
     Python 2.6 or higher is required for HTTPS support.  Users of Python 2.5
     should use the curl-based AsyncHTTPClient if HTTPS support is required.
+
     """
-    _ASYNC_CLIENTS = weakref.WeakKeyDictionary()
+    def initialize(self, io_loop=None, max_clients=10,
+                   max_simultaneous_connections=None,
+                   hostname_mapping=None):
+        """Creates a AsyncHTTPClient.
 
-    def __new__(cls, io_loop=None, max_clients=10,
-                max_simultaneous_connections=None,
-                force_instance=False):
-        """Creates a SimpleAsyncHTTPClient.
-
-        Only a single SimpleAsyncHTTPClient instance exists per IOLoop
+        Only a single AsyncHTTPClient instance exists per IOLoop
         in order to provide limitations on the number of pending connections.
         force_instance=True may be used to suppress this behavior.
 
@@ -61,22 +68,17 @@ class SimpleAsyncHTTPClient(object):
         only for compatibility with the curl-based AsyncHTTPClient.  Note
         that these arguments are only used when the client is first created,
         and will be ignored when an existing client is reused.
-        """
-        io_loop = io_loop or IOLoop.instance()
-        if io_loop in cls._ASYNC_CLIENTS and not force_instance:
-            return cls._ASYNC_CLIENTS[io_loop]
-        else:
-            instance = super(SimpleAsyncHTTPClient, cls).__new__(cls)
-            instance.io_loop = io_loop
-            instance.max_clients = max_clients
-            instance.queue = collections.deque()
-            instance.active = {}
-            if not force_instance:
-                cls._ASYNC_CLIENTS[io_loop] = instance
-            return instance
 
-    def close(self):
-        pass
+        hostname_mapping is a dictionary mapping hostnames to IP addresses.
+        It can be used to make local DNS changes when modifying system-wide
+        settings like /etc/hosts is not possible or desirable (e.g. in
+        unittests).
+        """
+        self.io_loop = io_loop
+        self.max_clients = max_clients
+        self.queue = collections.deque()
+        self.active = {}
+        self.hostname_mapping = hostname_mapping
 
     def fetch(self, request, callback, **kwargs):
         if not isinstance(request, HTTPRequest):
@@ -97,7 +99,7 @@ class SimpleAsyncHTTPClient(object):
                 request, callback = self.queue.popleft()
                 key = object()
                 self.active[key] = (request, callback)
-                _HTTPConnection(self.io_loop, request,
+                _HTTPConnection(self.io_loop, self, request,
                                 functools.partial(self._on_fetch_complete,
                                                   key, callback))
 
@@ -111,9 +113,10 @@ class SimpleAsyncHTTPClient(object):
 class _HTTPConnection(object):
     _SUPPORTED_METHODS = set(["GET", "HEAD", "POST", "PUT", "DELETE"])
 
-    def __init__(self, io_loop, request, callback):
+    def __init__(self, io_loop, client, request, callback):
         self.start_time = time.time()
         self.io_loop = io_loop
+        self.client = client
         self.request = request
         self.callback = callback
         self.code = None
@@ -130,11 +133,20 @@ class _HTTPConnection(object):
             else:
                 host = parsed.netloc
                 port = 443 if parsed.scheme == "https" else 80
+            if self.client.hostname_mapping is not None:
+                host = self.client.hostname_mapping.get(host, host)
 
             if parsed.scheme == "https":
-                # TODO: cert verification, etc
+                ssl_options = {}
+                if request.validate_cert:
+                    ssl_options["cert_reqs"] = ssl.CERT_REQUIRED
+                if request.ca_certs is not None:
+                    ssl_options["ca_certs"] = request.ca_certs
+                else:
+                    ssl_options["ca_certs"] = _DEFAULT_CA_CERTS
                 self.stream = SSLIOStream(socket.socket(),
-                                          io_loop=self.io_loop)
+                                          io_loop=self.io_loop,
+                                          ssl_options=ssl_options)
             else:
                 self.stream = IOStream(socket.socket(),
                                        io_loop=self.io_loop)
@@ -143,16 +155,17 @@ class _HTTPConnection(object):
                 self._connect_timeout = self.io_loop.add_timeout(
                     self.start_time + timeout,
                     self._on_timeout)
+            self.stream.set_close_callback(self._on_close)
             self.stream.connect((host, port),
                                 functools.partial(self._on_connect, parsed))
 
     def _on_timeout(self):
         self._timeout = None
-        self.stream.close()
         if self.callback is not None:
             self.callback(HTTPResponse(self.request, 599,
                                        error=HTTPError(599, "Timeout")))
             self.callback = None
+        self.stream.close()
 
     def _on_connect(self, parsed):
         if self._timeout is not None:
@@ -162,12 +175,18 @@ class _HTTPConnection(object):
             self._timeout = self.io_loop.add_timeout(
                 self.start_time + self.request.request_timeout,
                 self._on_timeout)
+        if (self.request.validate_cert and
+            isinstance(self.stream, SSLIOStream)):
+            match_hostname(self.stream.socket.getpeercert(),
+                           parsed.netloc.partition(":")[0])
         if (self.request.method not in self._SUPPORTED_METHODS and
             not self.request.allow_nonstandard_methods):
             raise KeyError("unknown method %s" % self.request.method)
-        if self.request.network_interface:
-            raise NotImplementedError(
-                "network interface selection not supported")
+        for key in ('network_interface',
+                    'proxy_host', 'proxy_port',
+                    'proxy_username', 'proxy_password'):
+            if getattr(self.request, key, None):
+                raise NotImplementedError('%s not supported' % key)
         if "Host" not in self.request.headers:
             self.request.headers["Host"] = parsed.netloc
         if self.request.auth_username:
@@ -207,8 +226,16 @@ class _HTTPConnection(object):
         except Exception, e:
             logging.warning("uncaught exception", exc_info=True)
             if self.callback is not None:
-                self.callback(HTTPResponse(self.request, 599, error=e))
+                callback = self.callback
                 self.callback = None
+                callback(HTTPResponse(self.request, 599, error=e))
+
+    def _on_close(self):
+        if self.callback is not None:
+            callback = self.callback
+            self.callback = None
+            callback(HTTPResponse(self.request, 599,
+                                  error=HTTPError(599, "Connection closed")))
 
     def _on_headers(self, data):
         first_line, _, header_data = data.partition("\r\n")
@@ -248,8 +275,24 @@ class _HTTPConnection(object):
             buffer = StringIO()
         else:
             buffer = StringIO(data) # TODO: don't require one big string?
-        response = HTTPResponse(self.request, self.code, headers=self.headers,
-                                buffer=buffer)
+        original_request = getattr(self.request, "original_request",
+                                   self.request)
+        if (self.request.follow_redirects and
+            self.request.max_redirects > 0 and
+            self.code in (301, 302)):
+            new_request = copy.copy(self.request)
+            new_request.url = urlparse.urljoin(self.request.url,
+                                               self.headers["Location"])
+            new_request.max_redirects -= 1
+            del new_request.headers["Host"]
+            new_request.original_request = original_request
+            self.client.fetch(new_request, self.callback)
+            self.callback = None
+            return
+        response = HTTPResponse(original_request,
+                                self.code, headers=self.headers,
+                                buffer=buffer,
+                                effective_url=self.request.url)
         self.callback(response)
         self.callback = None
 
@@ -277,8 +320,69 @@ class _HTTPConnection(object):
         self.stream.read_until("\r\n", self._on_chunk_length)
 
 
+# match_hostname was added to the standard library ssl module in python 3.2.
+# The following code was backported for older releases and copied from
+# https://bitbucket.org/brandon/backports.ssl_match_hostname
+class CertificateError(ValueError):
+    pass
+
+def _dnsname_to_pat(dn):
+    pats = []
+    for frag in dn.split(r'.'):
+        if frag == '*':
+            # When '*' is a fragment by itself, it matches a non-empty dotless
+            # fragment.
+            pats.append('[^.]+')
+        else:
+            # Otherwise, '*' matches any dotless fragment.
+            frag = re.escape(frag)
+            pats.append(frag.replace(r'\*', '[^.]*'))
+    return re.compile(r'\A' + r'\.'.join(pats) + r'\Z', re.IGNORECASE)
+
+def match_hostname(cert, hostname):
+    """Verify that *cert* (in decoded format as returned by
+    SSLSocket.getpeercert()) matches the *hostname*.  RFC 2818 rules
+    are mostly followed, but IP addresses are not accepted for *hostname*.
+
+    CertificateError is raised on failure. On success, the function
+    returns nothing.
+    """
+    if not cert:
+        raise ValueError("empty or no certificate")
+    dnsnames = []
+    san = cert.get('subjectAltName', ())
+    for key, value in san:
+        if key == 'DNS':
+            if _dnsname_to_pat(value).match(hostname):
+                return
+            dnsnames.append(value)
+    if not san:
+        # The subject is only checked when subjectAltName is empty
+        for sub in cert.get('subject', ()):
+            for key, value in sub:
+                # XXX according to RFC 2818, the most specific Common Name
+                # must be used.
+                if key == 'commonName':
+                    if _dnsname_to_pat(value).match(hostname):
+                        return
+                    dnsnames.append(value)
+    if len(dnsnames) > 1:
+        raise CertificateError("hostname %r "
+            "doesn't match either of %s"
+            % (hostname, ', '.join(map(repr, dnsnames))))
+    elif len(dnsnames) == 1:
+        raise CertificateError("hostname %r "
+            "doesn't match %r"
+            % (hostname, dnsnames[0]))
+    else:
+        raise CertificateError("no appropriate commonName or "
+            "subjectAltName fields were found")
+
 def main():
     from tornado.options import define, options, parse_command_line
+    define("print_headers", type=bool, default=False)
+    define("print_body", type=bool, default=True)
+    define("follow_redirects", type=bool, default=True)
     args = parse_command_line()
     client = SimpleAsyncHTTPClient()
     io_loop = IOLoop.instance()
@@ -286,8 +390,11 @@ def main():
         def callback(response):
             io_loop.stop()
             response.rethrow()
-            print response.body
-        client.fetch(arg, callback)
+            if options.print_headers:
+                print response.headers
+            if options.print_body:
+                print response.body
+        client.fetch(arg, callback, follow_redirects=options.follow_redirects)
         io_loop.start()
 
 if __name__ == "__main__":

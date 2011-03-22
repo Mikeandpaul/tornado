@@ -25,6 +25,7 @@ import time
 import traceback
 
 from tornado import stack_context
+from tornado.escape import utf8
 
 try:
     import signal
@@ -100,7 +101,7 @@ class IOLoop(object):
             self._set_close_exec(self._impl.fileno())
         self._handlers = {}
         self._events = {}
-        self._callbacks = set()
+        self._callbacks = []
         self._timeouts = []
         self._running = False
         self._stopped = False
@@ -214,12 +215,10 @@ class IOLoop(object):
 
             # Prevent IO event starvation by delaying new callbacks
             # to the next iteration of the event loop.
-            callbacks = list(self._callbacks)
+            callbacks = self._callbacks
+            self._callbacks = []
             for callback in callbacks:
-                # A callback can add or remove other callbacks
-                if callback in self._callbacks:
-                    self._callbacks.remove(callback)
-                    self._run_callback(callback)
+                self._run_callback(callback)
 
             if self._callbacks:
                 poll_timeout = 0.0
@@ -252,7 +251,6 @@ class IOLoop(object):
                 if (getattr(e, 'errno', None) == errno.EINTR or
                     (isinstance(getattr(e, 'args', None), tuple) and
                      len(e.args) == 2 and e.args[0] == errno.EINTR)):
-                    logging.warning("Interrupted system call", exc_info=1)
                     continue
                 else:
                     raise
@@ -325,13 +323,20 @@ class IOLoop(object):
         self._timeouts.remove(timeout)
 
     def add_callback(self, callback):
-        """Calls the given callback on the next I/O loop iteration."""
-        self._callbacks.add(stack_context.wrap(callback))
+        """Calls the given callback on the next I/O loop iteration.
+
+        It is safe to call this method from any thread at any time.
+        Note that this is the *only* method in IOLoop that makes this
+        guarantee; all other interaction with the IOLoop must be done
+        from that IOLoop's thread.  add_callback() may be used to transfer
+        control from other threads to the IOLoop's thread.
+        """
+        self._callbacks.append(stack_context.wrap(callback))
         self._wake()
 
     def _wake(self):
         try:
-            self._waker_writer.write("x")
+            self._waker_writer.write(utf8("x"))
         except IOError:
             pass
 
@@ -358,7 +363,8 @@ class IOLoop(object):
     def _read_waker(self, fd, events):
         try:
             while True:
-                self._waker_reader.read()
+                result = self._waker_reader.read()
+                if not result: break
         except IOError:
             pass
 
@@ -381,9 +387,9 @@ class _Timeout(object):
         self.deadline = deadline
         self.callback = callback
 
-    def __cmp__(self, other):
-        return cmp((self.deadline, id(self.callback)),
-                   (other.deadline, id(other.callback)))
+    def __lt__(self, other):
+        return ((self.deadline, id(self.callback)) <
+                (other.deadline, id(other.callback)))
 
     def __repr__(self):
         return '<Timeout: %s %s>' % (self.deadline, self.callback)
@@ -488,7 +494,17 @@ class _KQueue(object):
             if kevent.filter == select.KQ_FILTER_READ:
                 events[fd] = events.get(fd, 0) | IOLoop.READ
             if kevent.filter == select.KQ_FILTER_WRITE:
-                events[fd] = events.get(fd, 0) | IOLoop.WRITE
+                if kevent.flags & select.KQ_EV_EOF:
+                    # If an asynchronous connection is refused, kqueue
+                    # returns a write event with the EOF flag set.
+                    # Turn this into an error for consistency with the
+                    # other IOLoop implementations.
+                    # Note that for read events, EOF may be returned before
+                    # all data has been consumed from the socket buffer,
+                    # so we only check for EOF on write events.
+                    events[fd] = IOLoop.ERROR
+                else:
+                    events[fd] = events.get(fd, 0) | IOLoop.WRITE
             if kevent.flags & select.KQ_EV_ERROR:
                 events[fd] = events.get(fd, 0) | IOLoop.ERROR
         return events.items()
