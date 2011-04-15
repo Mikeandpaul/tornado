@@ -23,6 +23,7 @@ import errno
 import logging
 import socket
 import sys
+import functools
 
 from tornado import ioloop
 from tornado import stack_context
@@ -222,7 +223,10 @@ class IOStream(object):
             self.close()
             raise
 
-    def _run_callback(self, callback, *args, **kwargs):
+    def _run_callback(self, *args, **kwargs):
+        ioloop.IOLoop.instance().add_callback( functools.partial(self.__run_callback, *args, **kwargs) )
+
+    def __run_callback(self, callback, *args, **kwargs):
         try:
             # Use a NullContext to ensure that all StackContexts are run
             # inside our blanket exception handler rather than outside.
