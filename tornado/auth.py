@@ -58,7 +58,9 @@ import uuid
 
 from tornado import httpclient
 from tornado import escape
+from tornado.httputil import url_concat
 from tornado.ioloop import IOLoop
+from tornado.util import bytes_type
 
 class OpenIdMixin(object):
     """Abstract implementation of OpenID and Attribute Exchange.
@@ -403,8 +405,8 @@ class OAuth2Mixin(object):
           "client_id": client_id
         }
         if extra_params: args.update(extra_params)
-        self.redirect(self._OAUTH_AUTHORIZE_URL +
-              urllib.urlencode(args))
+        self.redirect(
+                url_concat(self._OAUTH_AUTHORIZE_URL, args))
 
     def _oauth_request_token_url(self, redirect_uri= None, client_id = None,
                                  client_secret=None, code=None,
@@ -417,7 +419,7 @@ class OAuth2Mixin(object):
             client_secret=client_secret,
             )
         if extra_params: args.update(extra_params)
-        return url + urllib.urlencode(args)
+        return url_concat(url, args)
 
 class TwitterMixin(OAuthMixin):
     """Twitter OAuth authentication.
@@ -800,7 +802,7 @@ class FacebookMixin(object):
             args["cancel_url"] = urlparse.urljoin(
                 self.request.full_url(), cancel_uri)
         if extended_permissions:
-            if isinstance(extended_permissions, basestring):
+            if isinstance(extended_permissions, (unicode, bytes_type)):
                 extended_permissions = [extended_permissions]
             args["req_perms"] = ",".join(extended_permissions)
         self.redirect("http://www.facebook.com/login.php?" +
