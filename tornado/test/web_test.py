@@ -1,5 +1,6 @@
 from tornado.escape import json_decode, utf8, to_unicode, recursive_unicode, native_str
 from tornado.iostream import IOStream
+from tornado.template import DictLoader
 from tornado.testing import LogTrapTestCase, AsyncHTTPTestCase
 from tornado.util import b, bytes_type
 from tornado.web import RequestHandler, _O, authenticated, Application, asynchronous, url
@@ -236,13 +237,38 @@ class DecodeArgHandler(RequestHandler):
                     'query': describe(self.get_argument("foo")),
                     })
 
+class LinkifyHandler(RequestHandler):
+    def get(self):
+        self.render("linkify.html", message="http://example.com")
+
+class UIModuleResourceHandler(RequestHandler):
+    def get(self):
+        self.render("page.html", entries=[1,2])
+
 class WebTest(AsyncHTTPTestCase, LogTrapTestCase):
     def get_app(self):
-        return Application([
-                url("/typecheck/(.*)", TypeCheckHandler, name='typecheck'),
-                url("/decode_arg/(.*)", DecodeArgHandler),
-                url("/decode_arg_kw/(?P<arg>.*)", DecodeArgHandler),
-                ])
+        loader = DictLoader({
+                "linkify.html": "{% module linkify(message) %}",
+                "page.html": """\
+<html><head></head><body>
+{% for e in entries %}
+{% module Template("entry.html", entry=e) %}
+{% end %}
+</body></html>""",
+                "entry.html": """\
+{{ set_resources(embedded_css=".entry { margin-bottom: 1em; }", embedded_javascript="js_embed()", css_files=["/base.css", "/foo.css"], javascript_files="/common.js", html_head="<meta>", html_body='<script src="/analytics.js"/>') }}
+<div class="entry">...</div>""",
+                })
+        urls = [
+            url("/typecheck/(.*)", TypeCheckHandler, name='typecheck'),
+            url("/decode_arg/(.*)", DecodeArgHandler),
+            url("/decode_arg_kw/(?P<arg>.*)", DecodeArgHandler),
+            url("/linkify", LinkifyHandler),
+            url("/uimodule_resources", UIModuleResourceHandler),
+            ]
+        return Application(urls,
+                           template_loader=loader,
+                           autoescape="xhtml_escape")
 
     def test_types(self):
         response = self.fetch("/typecheck/asdf?foo=bar",
@@ -274,3 +300,33 @@ class WebTest(AsyncHTTPTestCase, LogTrapTestCase):
         self.assertEqual(data, {u'path': [u'bytes', u'c3a9'],
                                 u'query': [u'bytes', u'c3a9'],
                                 })
+
+    def test_uimodule_unescaped(self):
+        response = self.fetch("/linkify")
+        self.assertEqual(response.body,
+                         b("<a href=\"http://example.com\">http://example.com</a>"))
+
+    def test_uimodule_resources(self):
+        response = self.fetch("/uimodule_resources")
+        self.assertEqual(response.body, b("""\
+<html><head><link href="/base.css" type="text/css" rel="stylesheet"/><link href="/foo.css" type="text/css" rel="stylesheet"/>
+<style type="text/css">
+.entry { margin-bottom: 1em; }
+</style>
+<meta>
+</head><body>
+
+
+<div class="entry">...</div>
+
+
+<div class="entry">...</div>
+
+<script src="/common.js" type="text/javascript"></script>
+<script type="text/javascript">
+//<![CDATA[
+js_embed()
+//]]>
+</script>
+<script src="/analytics.js"/>
+</body></html>"""))
