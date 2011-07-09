@@ -1768,6 +1768,8 @@ def _unicode(s):
             return s.decode("utf-8")
         except UnicodeDecodeError:
             raise HTTPError(400, "Non-utf8 argument")
+    if s is None:
+        return s
     assert isinstance(s, unicode)
     return s
 
