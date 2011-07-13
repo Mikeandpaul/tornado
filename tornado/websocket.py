@@ -72,6 +72,7 @@ class WebSocketHandler(tornado.web.RequestHandler):
         self.stream = request.connection.stream
         self.client_terminated = False
         self._waiting = None
+	self.secure = True if 'secure' in application.settings and application.settings['secure'] else False
 
     def _execute(self, transforms, *args, **kwargs):
         self.open_args = args
@@ -82,7 +83,7 @@ class WebSocketHandler(tornado.web.RequestHandler):
             logging.debug("Malformed WebSocket request received")
             self._abort()
             return
-        scheme = "wss" if self.request.protocol == "https" else "ws"
+        scheme = "wss" if (self.request.protocol == "https" or self.secure) else "ws"
         # Write the initial headers before attempting to read the challenge.
         # This is necessary when using proxies (such as HAProxy), which
         # need to see the Upgrade headers before passing through the
