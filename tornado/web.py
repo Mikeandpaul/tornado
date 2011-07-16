@@ -630,6 +630,7 @@ class RequestHandler(object):
                 content_length = sum(len(part) for part in self._write_buffer)
                 self.set_header("Content-Length", content_length)
 
+	self.set_header('X-XSS-Protection', 0)
         if hasattr(self.request, "connection"):
             # Now that the request is finished, clear the callback we
             # set on the IOStream (which would otherwise prevent the
