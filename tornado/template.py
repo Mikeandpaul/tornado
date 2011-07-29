@@ -16,19 +16,19 @@
 
 """A simple template system that compiles templates to Python code.
 
-Basic usage looks like:
+Basic usage looks like::
 
     t = template.Template("<html>{{ myvalue }}</html>")
     print t.generate(myvalue="XXX")
 
 Loader is a class that loads templates from a root directory and caches
-the compiled templates:
+the compiled templates::
 
     loader = template.Loader("/home/btaylor")
     print loader.load("test.html").generate(myvalue="XXX")
 
 We compile all templates to raw Python. Error-reporting is currently... uh,
-interesting. Syntax for the templates
+interesting. Syntax for the templates::
 
     ### base.html
     <html>
@@ -57,7 +57,7 @@ interesting. Syntax for the templates
 
 Unlike most other template systems, we do not put any restrictions on the
 expressions you can include in your statements. if and for blocks get
-translated exactly into Python, do you can do complex expressions like:
+translated exactly into Python, do you can do complex expressions like::
 
    {% for student in [p for p in people if p.student and p.age > 23] %}
      <li>{{ escape(student.name) }}</li>
@@ -65,7 +65,7 @@ translated exactly into Python, do you can do complex expressions like:
 
 Translating directly to Python means you can apply functions to expressions
 easily, like the escape() function in the examples above. You can pass
-functions in to your template just like any other variable:
+functions in to your template just like any other variable::
 
    ### Python code
    def add(x, y):
@@ -77,6 +77,11 @@ functions in to your template just like any other variable:
 
 We provide the functions escape(), url_escape(), json_encode(), and squeeze()
 to all templates by default.
+
+Typical applications do not create `Template` or `Loader` instances by
+hand, but instead use the `render` and `render_string` methods of
+`tornado.web.RequestHandler`, which load templates automatically based
+on the ``template_path`` `Application` setting.
 """
 
 from __future__ import with_statement
@@ -85,12 +90,13 @@ import cStringIO
 import datetime
 import logging
 import os.path
+import posixpath
 import re
 
 from tornado import escape
 from tornado.util import bytes_type
 
-_DEFAULT_AUTOESCAPE = None
+_DEFAULT_AUTOESCAPE = "xhtml_escape"
 _UNSET = object()
 
 class Template(object):
@@ -115,8 +121,10 @@ class Template(object):
         self.file = _File(_parse(reader, self))
         self.code = self._generate_python(loader, compress_whitespace)
         try:
-            self.compiled = compile(self.code, self.name, "exec")
-        except:
+            self.compiled = compile(escape.to_unicode(self.code),
+                                    "<template %s>" % self.name,
+                                    "exec")
+        except Exception:
             formatted_code = _format_code(self.code).rstrip()
             logging.error("%s code:\n%s", self.name, formatted_code)
             raise
@@ -139,7 +147,7 @@ class Template(object):
         execute = namespace["_execute"]
         try:
             return execute()
-        except:
+        except Exception:
             formatted_code = _format_code(self.code).rstrip()
             logging.error("%s code:\n%s", self.name, formatted_code)
             raise
@@ -174,7 +182,8 @@ class Template(object):
 
 
 class BaseLoader(object):
-    def __init__(self, root_directory, autoescape=_DEFAULT_AUTOESCAPE):
+    """Base class for template loaders."""
+    def __init__(self, autoescape=_DEFAULT_AUTOESCAPE):
         """Creates a template loader.
 
         root_directory may be the empty string if this loader does not
@@ -183,25 +192,19 @@ class BaseLoader(object):
         autoescape must be either None or a string naming a function
         in the template namespace, such as "xhtml_escape".
         """
-        self.root = os.path.abspath(root_directory)
         self.autoescape = autoescape
         self.templates = {}
 
     def reset(self):
+        """Resets the cache of compiled templates."""
         self.templates = {}
 
     def resolve_path(self, name, parent_path=None):
-        if parent_path and not parent_path.startswith("<") and \
-           not parent_path.startswith("/") and \
-           not name.startswith("/"):
-            current_path = os.path.join(self.root, parent_path)
-            file_dir = os.path.dirname(os.path.abspath(current_path))
-            relative_path = os.path.abspath(os.path.join(file_dir, name))
-            if relative_path.startswith(self.root):
-                name = relative_path[len(self.root) + 1:]
-        return name
+        """Converts a possibly-relative path to absolute (used internally)."""
+        raise NotImplementedError()
 
     def load(self, name, parent_path=None):
+        """Loads a template."""
         name = self.resolve_path(name, parent_path=parent_path)
         if name not in self.templates:
             self.templates[name] = self._create_template(name)
@@ -218,7 +221,20 @@ class Loader(BaseLoader):
     they are loaded the first time.
     """
     def __init__(self, root_directory, **kwargs):
-        super(Loader, self).__init__(root_directory, **kwargs)
+        super(Loader, self).__init__(**kwargs)
+        self.root = os.path.abspath(root_directory)
+
+
+    def resolve_path(self, name, parent_path=None):
+        if parent_path and not parent_path.startswith("<") and \
+           not parent_path.startswith("/") and \
+           not name.startswith("/"):
+            current_path = os.path.join(self.root, parent_path)
+            file_dir = os.path.dirname(os.path.abspath(current_path))
+            relative_path = os.path.abspath(os.path.join(file_dir, name))
+            if relative_path.startswith(self.root):
+                name = relative_path[len(self.root) + 1:]
+        return name
 
     def _create_template(self, name):
         path = os.path.join(self.root, name)
@@ -231,8 +247,16 @@ class Loader(BaseLoader):
 class DictLoader(BaseLoader):
     """A template loader that loads from a dictionary."""
     def __init__(self, dict, **kwargs):
-        super(DictLoader, self).__init__("", **kwargs)
+        super(DictLoader, self).__init__(**kwargs)
         self.dict = dict
+
+    def resolve_path(self, name, parent_path=None):
+        if parent_path and not parent_path.startswith("<") and \
+           not parent_path.startswith("/") and \
+           not name.startswith("/"):
+            file_dir = posixpath.dirname(parent_path)
+            name = posixpath.normpath(posixpath.join(file_dir, name))
+        return name
 
     def _create_template(self, name):
         return Template(self.dict[name], name=name, loader=self)
@@ -542,6 +566,15 @@ def _parse(reader, template, in_block=None):
 
         start_brace = reader.consume(2)
         line = reader.line
+
+        # Template directives may be escaped as "{{!" or "{%!".
+        # In this case output the braces and consume the "!".
+        # This is especially useful in conjunction with jquery templates,
+        # which also use double braces.
+        if reader.remaining() and reader[0] == "!":
+            reader.consume(1)
+            body.chunks.append(_Text(start_brace))
+            continue
 
         # Expression
         if start_brace == "{{":

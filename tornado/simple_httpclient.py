@@ -2,7 +2,7 @@
 from __future__ import with_statement
 
 from tornado.escape import utf8, _unicode, native_str
-from tornado.httpclient import HTTPRequest, HTTPResponse, HTTPError, AsyncHTTPClient
+from tornado.httpclient import HTTPRequest, HTTPResponse, HTTPError, AsyncHTTPClient, main
 from tornado.httputil import HTTPHeaders
 from tornado.ioloop import IOLoop
 from tornado.iostream import IOStream, SSLIOStream
@@ -13,7 +13,6 @@ import base64
 import collections
 import contextlib
 import copy
-import errno
 import functools
 import logging
 import os.path
@@ -63,7 +62,7 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
     """
     def initialize(self, io_loop=None, max_clients=10,
                    max_simultaneous_connections=None,
-                   hostname_mapping=None):
+                   hostname_mapping=None, max_buffer_size=104857600):
         """Creates a AsyncHTTPClient.
 
         Only a single AsyncHTTPClient instance exists per IOLoop
@@ -80,12 +79,16 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
         It can be used to make local DNS changes when modifying system-wide
         settings like /etc/hosts is not possible or desirable (e.g. in
         unittests).
+
+        max_buffer_size is the number of bytes that can be read by IOStream. It
+        defaults to 100mb.
         """
         self.io_loop = io_loop
         self.max_clients = max_clients
         self.queue = collections.deque()
         self.active = {}
         self.hostname_mapping = hostname_mapping
+        self.max_buffer_size = max_buffer_size
 
     def fetch(self, request, callback, **kwargs):
         if not isinstance(request, HTTPRequest):
@@ -108,7 +111,8 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
                 self.active[key] = (request, callback)
                 _HTTPConnection(self.io_loop, self, request,
                                 functools.partial(self._on_fetch_complete,
-                                                  key, callback))
+                                                  key, callback),
+                                self.max_buffer_size)
 
     def _on_fetch_complete(self, key, callback, response):
         del self.active[key]
@@ -120,7 +124,7 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
 class _HTTPConnection(object):
     _SUPPORTED_METHODS = set(["GET", "HEAD", "POST", "PUT", "DELETE"])
 
-    def __init__(self, io_loop, client, request, callback):
+    def __init__(self, io_loop, client, request, callback, max_buffer_size):
         self.start_time = time.time()
         self.io_loop = io_loop
         self.client = client
@@ -134,6 +138,12 @@ class _HTTPConnection(object):
         self._timeout = None
         with stack_context.StackContext(self.cleanup):
             parsed = urlparse.urlsplit(_unicode(self.request.url))
+            if ssl is None and parsed.scheme == "https":
+                raise ValueError("HTTPS requires either python2.6+ or "
+                                 "curl_httpclient")
+            if parsed.scheme not in ("http", "https"):
+                raise ValueError("Unsupported url scheme: %s" %
+                                 self.request.url)
             # urlsplit results have hostname and port results, but they
             # didn't support ipv6 literals until python 2.7.
             netloc = parsed.netloc
@@ -171,12 +181,18 @@ class _HTTPConnection(object):
                     ssl_options["ca_certs"] = request.ca_certs
                 else:
                     ssl_options["ca_certs"] = _DEFAULT_CA_CERTS
+                if request.client_key is not None:
+                    ssl_options["keyfile"] = request.client_key
+                if request.client_cert is not None:
+                    ssl_options["certfile"] = request.client_cert
                 self.stream = SSLIOStream(socket.socket(af, socktype, proto),
                                           io_loop=self.io_loop,
-                                          ssl_options=ssl_options)
+                                          ssl_options=ssl_options,
+                                          max_buffer_size=max_buffer_size)
             else:
                 self.stream = IOStream(socket.socket(af, socktype, proto),
-                                       io_loop=self.io_loop)
+                                       io_loop=self.io_loop,
+                                       max_buffer_size=max_buffer_size)
             timeout = min(request.connect_timeout, request.request_timeout)
             if timeout:
                 self._connect_timeout = self.io_loop.add_timeout(
@@ -228,13 +244,14 @@ class _HTTPConnection(object):
                                                      base64.b64encode(auth))
         if self.request.user_agent:
             self.request.headers["User-Agent"] = self.request.user_agent
-        has_body = self.request.method in ("POST", "PUT")
-        if has_body:
-            assert self.request.body is not None
+        if not self.request.allow_nonstandard_methods:
+            if self.request.method in ("POST", "PUT"):
+                assert self.request.body is not None
+            else:
+                assert self.request.body is None
+        if self.request.body is not None:
             self.request.headers["Content-Length"] = str(len(
-                self.request.body))
-        else:
-            assert self.request.body is None
+                    self.request.body))
         if (self.request.method == "POST" and
             "Content-Type" not in self.request.headers):
             self.request.headers["Content-Type"] = "application/x-www-form-urlencoded"
@@ -250,9 +267,15 @@ class _HTTPConnection(object):
                 raise ValueError('Newline in header: ' + repr(line))
             request_lines.append(line)
         self.stream.write(b("\r\n").join(request_lines) + b("\r\n\r\n"))
-        if has_body:
+        if self.request.body is not None:
             self.stream.write(self.request.body)
         self.stream.read_until(b("\r\n\r\n"), self._on_headers)
+
+    def _run_callback(self, response):
+        if self.callback is not None:
+            callback = self.callback
+            self.callback = None
+            callback(response)
 
     @contextlib.contextmanager
     def cleanup(self):
@@ -260,17 +283,12 @@ class _HTTPConnection(object):
             yield
         except Exception, e:
             logging.warning("uncaught exception", exc_info=True)
-            if self.callback is not None:
-                callback = self.callback
-                self.callback = None
-                callback(HTTPResponse(self.request, 599, error=e))
+            self._run_callback(HTTPResponse(self.request, 599, error=e))
 
     def _on_close(self):
-        if self.callback is not None:
-            callback = self.callback
-            self.callback = None
-            callback(HTTPResponse(self.request, 599,
-                                  error=HTTPError(599, "Connection closed")))
+        self._run_callback(HTTPResponse(
+                self.request, 599,
+                error=HTTPError(599, "Connection closed")))
 
     def _on_headers(self, data):
         data = native_str(data.decode("latin1"))
@@ -291,11 +309,19 @@ class _HTTPConnection(object):
             self.chunks = []
             self.stream.read_until(b("\r\n"), self._on_chunk_length)
         elif "Content-Length" in self.headers:
+            if "," in self.headers["Content-Length"]:
+                # Proxies sometimes cause Content-Length headers to get
+                # duplicated.  If all the values are identical then we can
+                # use them but if they differ it's an error.
+                pieces = re.split(r',\s*', self.headers["Content-Length"])
+                if any(i != pieces[0] for i in pieces):
+                    raise ValueError("Multiple unequal Content-Lengths: %r" % 
+                                     self.headers["Content-Length"])
+                self.headers["Content-Length"] = pieces[0]
             self.stream.read_bytes(int(self.headers["Content-Length"]),
                                    self._on_body)
         else:
-            raise Exception("No Content-length or chunked encoding, "
-                            "don't know how to read %s", self.request.url)
+            self.stream.read_until_close(self._on_body)
 
     def _on_body(self, data):
         if self._timeout is not None:
@@ -329,9 +355,8 @@ class _HTTPConnection(object):
                                 self.code, headers=self.headers,
                                 buffer=buffer,
                                 effective_url=self.request.url)
-        if self.callback:
-            self.callback(response)
-        self.callback = None
+        self._run_callback(response)
+        self.stream.close()
 
     def _on_chunk_length(self, data):
         # TODO: "chunk extensions" http://tools.ietf.org/html/rfc2616#section-3.6.1
@@ -415,24 +440,6 @@ def match_hostname(cert, hostname):
         raise CertificateError("no appropriate commonName or "
             "subjectAltName fields were found")
 
-def main():
-    from tornado.options import define, options, parse_command_line
-    define("print_headers", type=bool, default=False)
-    define("print_body", type=bool, default=True)
-    define("follow_redirects", type=bool, default=True)
-    args = parse_command_line()
-    client = SimpleAsyncHTTPClient()
-    io_loop = IOLoop.instance()
-    for arg in args:
-        def callback(response):
-            io_loop.stop()
-            response.rethrow()
-            if options.print_headers:
-                print response.headers
-            if options.print_body:
-                print response.body
-        client.fetch(arg, callback, follow_redirects=options.follow_redirects)
-        io_loop.start()
-
 if __name__ == "__main__":
+    AsyncHTTPClient.configure(SimpleAsyncHTTPClient)
     main()

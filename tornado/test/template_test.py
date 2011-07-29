@@ -1,5 +1,5 @@
 from tornado.escape import utf8, native_str
-from tornado.template import Template, DictLoader
+from tornado.template import Template, DictLoader, ParseError
 from tornado.testing import LogTrapTestCase
 from tornado.util import b, bytes_type
 
@@ -49,6 +49,32 @@ class TemplateTest(LogTrapTestCase):
                 })
         self.assertEqual(loader.load("a/1.html").generate(),
                          b("ok"))
+
+    def test_escaping(self):
+        self.assertRaises(ParseError, lambda: Template("{{"))
+        self.assertRaises(ParseError, lambda: Template("{%"))
+        self.assertEqual(Template("{{!").generate(), b("{{"))
+        self.assertEqual(Template("{%!").generate(), b("{%"))
+        self.assertEqual(Template("{{ 'expr' }} {{!jquery expr}}").generate(),
+                         b("expr {{jquery expr}}"))
+
+    def test_unicode_template(self):
+        template = Template(utf8(u"\u00e9"))
+        self.assertEqual(template.generate(), utf8(u"\u00e9"))
+
+    def test_unicode_literal_expression(self):
+        # Unicode literals should be usable in templates.  Note that this
+        # test simulates unicode characters appearing directly in the
+        # template file (with utf8 encoding), i.e. \u escapes would not
+        # be used in the template file itself.
+        if str is unicode:
+            # python 3 needs a different version of this test since
+            # 2to3 doesn't run on template internals
+            template = Template(utf8(u'{{ "\u00e9" }}'))
+        else:
+            template = Template(utf8(u'{{ u"\u00e9" }}'))
+        self.assertEqual(template.generate(), utf8(u"\u00e9"))
+        
 
 class AutoEscapeTest(LogTrapTestCase):
     def setUp(self):

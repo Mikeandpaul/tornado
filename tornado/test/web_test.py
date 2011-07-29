@@ -3,13 +3,13 @@ from tornado.iostream import IOStream
 from tornado.template import DictLoader
 from tornado.testing import LogTrapTestCase, AsyncHTTPTestCase
 from tornado.util import b, bytes_type
-from tornado.web import RequestHandler, _O, authenticated, Application, asynchronous, url
+from tornado.web import RequestHandler, _O, authenticated, Application, asynchronous, url, HTTPError
 
 import binascii
 import logging
 import re
 import socket
-import tornado.ioloop
+import sys
 
 class CookieTestRequestHandler(RequestHandler):
     # stub out enough methods to make the secure_cookie functions work
@@ -66,9 +66,26 @@ class CookieTest(AsyncHTTPTestCase, LogTrapTestCase):
             def get(self):
                 self.write(self.get_cookie("foo"))
 
+        class SetCookieDomainHandler(RequestHandler):
+            def get(self):
+                # unicode domain and path arguments shouldn't break things
+                # either (see bug #285)
+                self.set_cookie("unicode_args", "blah", domain=u"foo.com",
+                                path=u"/foo")
+
+        class SetCookieSpecialCharHandler(RequestHandler):
+            def get(self):
+                self.set_cookie("equals", "a=b")
+                self.set_cookie("semicolon", "a;b")
+                self.set_cookie("quote", 'a"b')
+
+
         return Application([
                 ("/set", SetCookieHandler),
-                ("/get", GetCookieHandler)])
+                ("/get", GetCookieHandler),
+                ("/set_domain", SetCookieDomainHandler),
+                ("/special_char", SetCookieSpecialCharHandler),
+                ])
 
     def test_set_cookie(self):
         response = self.fetch("/set")
@@ -80,6 +97,37 @@ class CookieTest(AsyncHTTPTestCase, LogTrapTestCase):
     def test_get_cookie(self):
         response = self.fetch("/get", headers={"Cookie": "foo=bar"})
         self.assertEqual(response.body, b("bar"))
+
+        response = self.fetch("/get", headers={"Cookie": 'foo="bar"'})
+        self.assertEqual(response.body, b("bar"))
+
+    def test_set_cookie_domain(self):
+        response = self.fetch("/set_domain")
+        self.assertEqual(response.headers.get_list("Set-Cookie"),
+                         ["unicode_args=blah; Domain=foo.com; Path=/foo"])
+
+    def test_cookie_special_char(self):
+        response = self.fetch("/special_char")
+        headers = response.headers.get_list("Set-Cookie")
+        self.assertEqual(len(headers), 3)
+        self.assertEqual(headers[0], 'equals="a=b"; Path=/')
+        # python 2.7 octal-escapes the semicolon; older versions leave it alone
+        self.assertTrue(headers[1] in ('semicolon="a;b"; Path=/',
+                                       'semicolon="a\\073b"; Path=/'),
+                        headers[1])
+        self.assertEqual(headers[2], 'quote="a\\"b"; Path=/')
+
+        data = [('foo=a=b', 'a=b'),
+                ('foo="a=b"', 'a=b'),
+                ('foo="a;b"', 'a;b'),
+                #('foo=a\\073b', 'a;b'),  # even encoded, ";" is a delimiter
+                ('foo="a\\073b"', 'a;b'),
+                ('foo="a\\"b"', 'a"b'),
+                ]
+        for header, expected in data:
+            logging.info("trying %r", header)
+            response = self.fetch("/get", headers={"Cookie": header})
+            self.assertEqual(response.body, utf8(expected))
 
 class AuthRedirectRequestHandler(RequestHandler):
     def initialize(self, login_url):
@@ -245,6 +293,26 @@ class UIModuleResourceHandler(RequestHandler):
     def get(self):
         self.render("page.html", entries=[1,2])
 
+class OptionalPathHandler(RequestHandler):
+    def get(self, path):
+        self.write({"path": path})
+
+class FlowControlHandler(RequestHandler):
+    # These writes are too small to demonstrate real flow control,
+    # but at least it shows that the callbacks get run.
+    @asynchronous
+    def get(self):
+        self.write("1")
+        self.flush(callback=self.step2)
+
+    def step2(self):
+        self.write("2")
+        self.flush(callback=self.step3)
+
+    def step3(self):
+        self.write("3")
+        self.finish()
+
 class WebTest(AsyncHTTPTestCase, LogTrapTestCase):
     def get_app(self):
         loader = DictLoader({
@@ -265,10 +333,17 @@ class WebTest(AsyncHTTPTestCase, LogTrapTestCase):
             url("/decode_arg_kw/(?P<arg>.*)", DecodeArgHandler),
             url("/linkify", LinkifyHandler),
             url("/uimodule_resources", UIModuleResourceHandler),
+            url("/optional_path/(.+)?", OptionalPathHandler),
+            url("/flow_control", FlowControlHandler),
             ]
         return Application(urls,
                            template_loader=loader,
                            autoescape="xhtml_escape")
+
+    def fetch_json(self, *args, **kwargs):
+        response = self.fetch(*args, **kwargs)
+        response.rethrow()
+        return json_decode(response.body)
 
     def test_types(self):
         response = self.fetch("/typecheck/asdf?foo=bar",
@@ -330,3 +405,96 @@ js_embed()
 </script>
 <script src="/analytics.js"/>
 </body></html>"""))
+
+    def test_optional_path(self):
+        self.assertEqual(self.fetch_json("/optional_path/foo"),
+                         {u"path": u"foo"})
+        self.assertEqual(self.fetch_json("/optional_path/"),
+                         {u"path": None})
+
+    def test_flow_control(self):
+        self.assertEqual(self.fetch("/flow_control").body, b("123"))
+
+
+class ErrorResponseTest(AsyncHTTPTestCase, LogTrapTestCase):
+    def get_app(self):
+        class DefaultHandler(RequestHandler):
+            def get(self):
+                if self.get_argument("status", None):
+                    raise HTTPError(int(self.get_argument("status")))
+                1/0
+
+        class WriteErrorHandler(RequestHandler):
+            def get(self):
+                if self.get_argument("status", None):
+                    self.send_error(int(self.get_argument("status")))
+                else:
+                    1/0
+
+            def write_error(self, status_code, **kwargs):
+                self.set_header("Content-Type", "text/plain")
+                if "exc_info" in kwargs:
+                    self.write("Exception: %s" % kwargs["exc_info"][0].__name__)
+                else:
+                    self.write("Status: %d" % status_code)
+
+        class GetErrorHtmlHandler(RequestHandler):
+            def get(self):
+                if self.get_argument("status", None):
+                    self.send_error(int(self.get_argument("status")))
+                else:
+                    1/0
+
+            def get_error_html(self, status_code, **kwargs):
+                self.set_header("Content-Type", "text/plain")
+                if "exception" in kwargs:
+                    self.write("Exception: %s" % sys.exc_info()[0].__name__)
+                else:
+                    self.write("Status: %d" % status_code)
+
+        class FailedWriteErrorHandler(RequestHandler):
+            def get(self):
+                1/0
+
+            def write_error(self, status_code, **kwargs):
+                raise Exception("exception in write_error")
+
+
+        return Application([
+                url("/default", DefaultHandler),
+                url("/write_error", WriteErrorHandler),
+                url("/get_error_html", GetErrorHtmlHandler),
+                url("/failed_write_error", FailedWriteErrorHandler),
+                ])
+
+    def test_default(self):
+        response = self.fetch("/default")
+        self.assertEqual(response.code, 500)
+        self.assertTrue(b("500: Internal Server Error") in response.body)
+
+        response = self.fetch("/default?status=503")
+        self.assertEqual(response.code, 503)
+        self.assertTrue(b("503: Service Unavailable") in response.body)
+
+    def test_write_error(self):
+        response = self.fetch("/write_error")
+        self.assertEqual(response.code, 500)
+        self.assertEqual(b("Exception: ZeroDivisionError"), response.body)
+
+        response = self.fetch("/write_error?status=503")
+        self.assertEqual(response.code, 503)
+        self.assertEqual(b("Status: 503"), response.body)
+
+    def test_get_error_html(self):
+        response = self.fetch("/get_error_html")
+        self.assertEqual(response.code, 500)
+        self.assertEqual(b("Exception: ZeroDivisionError"), response.body)
+
+        response = self.fetch("/get_error_html?status=503")
+        self.assertEqual(response.code, 503)
+        self.assertEqual(b("Status: 503"), response.body)
+
+    def test_failed_write_error(self):
+        response = self.fetch("/failed_write_error")
+        self.assertEqual(response.code, 500)
+        self.assertEqual(b(""), response.body)
