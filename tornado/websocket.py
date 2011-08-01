@@ -71,6 +71,7 @@ class WebSocketHandler(tornado.web.RequestHandler):
                                             **kwargs)
         self.stream = request.connection.stream
         self.ws_connection = None
+        self.secure = True if 'secure' in application.settings and application.settings['secure'] else False
 
     def _execute(self, transforms, *args, **kwargs):
         self.open_args = args
@@ -89,6 +90,7 @@ class WebSocketHandler(tornado.web.RequestHandler):
             
         else:
             self.ws_connection = WebSocketProtocol76(self)
+            self.ws_connection.secure = self.secure
             self.ws_connection.accept_connection()
 
     def write_message(self, message):
@@ -188,7 +190,6 @@ class WebSocketProtocol76(WebSocketProtocol):
         WebSocketProtocol.__init__(self, handler)
         self.challenge = None
         self._waiting = None
-        self.secure = True if 'secure' in application.settings and application.settings['secure'] else False
 
     def accept_connection(self):
         try:
